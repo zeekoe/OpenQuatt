@@ -45,10 +45,14 @@ struct LevelEstimate {
 };
 struct HpInput {
   oq_hp_candidate::HpCandidateState candidate;
-  bool defrost = false, valve_defrost = false;
-  bool stop_inhibited = false;
+  // Keep feedback metadata inside the existing dispatch stack budget.
+  bool defrost : 1;
+  bool valve_defrost : 1;
+  bool stop_inhibited : 1;
   uint8_t fixed_level = 0;
+  uint8_t feedback_hold_level = 0;
   std::array<LevelEstimate, kMaxLevel + 1> levels{};
+  HpInput() : defrost(false), valve_defrost(false), stop_inhibited(false) {}
 };
 struct TimedTail {
   bool previous_active = false, armed = false;
@@ -67,13 +71,18 @@ struct ProtectionObservation {
   bool hp1_valve_defrost = false, hp2_valve_defrost = false, oil_return = false;
   int hp1_applied_level = 0, hp2_applied_level = 0;
 };
+using PairPower = std::array<float, 2> (*)(const void*, int, int);
 struct DispatchInput {
   uint32_t now_ms = 0;
   float requested_w = NAN;
   bool duo = false, performance_valid = false, lead_hp1 = true;
   HpInput hp1, hp2;
-  std::array<float, 2> (*pair_power)(const void*, int, int) = nullptr;
+  PairPower pair_power = nullptr;
   const void* pair_context = nullptr;
+};
+using ConfirmedPower = float (*)(const void*, int, int, float);
+struct PendingSinglePower {
+  float thermal_w = 0.0f, electrical_w = 0.0f;
 };
 
 enum class PerformanceSupplyRoute : uint8_t { NONE = 0, SYSTEM, HP1_OUTLET, HP2_OUTLET };
@@ -187,7 +196,8 @@ inline bool electrical_limits_valid(const DispatchTuning& tuning) {
          tuning.peak_limit_w >= tuning.soft_limit_w;
 }
 inline Candidate make_candidate(const DispatchInput& in, const DispatchTuning& tuning, int hp1_level, int hp2_level,
-                                float target_w) {
+                                float target_w, bool allow_feedback_upshift = false,
+                                PairPower reference_f1_power = nullptr) {
   Candidate result;
   result.hp1_level = hp1_level;
   result.hp2_level = in.duo ? hp2_level : 0;
@@ -197,13 +207,20 @@ inline Candidate make_candidate(const DispatchInput& in, const DispatchTuning& t
   if (!electrical_limits_valid(tuning) || !std::isfinite(target_w) || target_w < 0.0f || result.hp1_level < 0 ||
       result.hp2_level < 0 || result.hp1_level > kMaxLevel || result.hp2_level > kMaxLevel)
     return result;
+  const auto pair_power = reference_f1_power != nullptr ? reference_f1_power : in.pair_power;
   auto add_hp = [&](const HpInput& hp, int level) {
     // Score only topologies the actuator can actually apply during its existing holds.
     if (hp.fixed_level > 0 && applied_level(hp) > 0 && !hp.candidate.must_stop && level != hp.fixed_level) return false;
+    // Let the ODU respond before another modulation change; this never forbids
+    // a stop allowed by the existing runtime and safety gates below.
+    if (reference_f1_power == nullptr && level > 0 && hp.feedback_hold_level > 0 && applied_level(hp) > 0 &&
+        !hp.candidate.must_stop && level != hp.feedback_hold_level &&
+        !(allow_feedback_upshift && level > hp.feedback_hold_level))
+      return false;
     if (level <= 0) return !hp.stop_inhibited || applied_level(hp) <= 0 || hp.candidate.must_stop;
     if (!hp_may_serve(hp)) return false;
     const auto& estimate = hp.levels[level];
-    if (in.pair_power != nullptr) return estimate.allowed;
+    if (pair_power != nullptr) return estimate.allowed;
     if (!estimate.allowed || !estimate.thermal_valid || !estimate.electrical_valid ||
         !std::isfinite(estimate.thermal_w) || !std::isfinite(estimate.electrical_w) || estimate.thermal_w < 0.0f ||
         estimate.electrical_w < 0.0f)
@@ -213,8 +230,8 @@ inline Candidate make_candidate(const DispatchInput& in, const DispatchTuning& t
     return true;
   };
   if (!add_hp(in.hp1, result.hp1_level) || !add_hp(in.hp2, result.hp2_level)) return result;
-  if (in.pair_power != nullptr) {
-    const auto power = in.pair_power(in.pair_context, result.hp1_level, result.hp2_level);
+  if (pair_power != nullptr) {
+    const auto power = pair_power(in.pair_context, result.hp1_level, result.hp2_level);
     result.thermal_w = power[0];
     result.electrical_w = power[1];
   }
@@ -255,6 +272,35 @@ inline bool better_candidate(const Candidate& a, const Candidate& b) {
     return a.single_on_lead;
   return a.hp1_level != b.hp1_level ? a.hp1_level < b.hp1_level : a.hp2_level < b.hp2_level;
 }
+inline bool fits_single_request(float output_w, float request_w, float tie_band_w, float maximum_error_w) {
+  return output_w + tie_band_w >= request_w && output_w <= request_w + maximum_error_w;
+}
+inline Candidate upshift_held_single(const DispatchInput& in, const DispatchTuning& tuning,
+                                     const Candidate& alternative, float tie_band_w, float maximum_error_w) {
+  const bool hp1_running = applied_level(in.hp1) > 0;
+  const auto& running = hp1_running ? in.hp1 : in.hp2;
+  const int previous = applied_level(running);
+
+  Candidate best;
+  for (int level = previous + 1; level <= kMaxLevel; ++level) {
+    const auto candidate =
+        make_candidate(in, tuning, hp1_running ? level : 0, hp1_running ? 0 : level, in.requested_w, true);
+    if (!candidate.valid || !fits_single_request(candidate.thermal_w, in.requested_w, tie_band_w, maximum_error_w) ||
+        candidate.over_soft_w > alternative.over_soft_w + 1.0f)
+      continue;
+    if (!best.valid || candidate.error_w < best.error_w ||
+        (candidate.error_w == best.error_w && better_candidate(candidate, best)))
+      best = candidate;
+  }
+  return best;
+}
+inline bool preserves_active_topology(const DispatchInput& in, int first, int second) {
+  if (!in.duo) return true;
+  const auto retained = oq_hp_candidate::preserve_active_topology_during_suspect(
+      {first, second, sanitized_candidate(in.hp1), sanitized_candidate(in.hp2), true});
+  return retained.hp1_level == first && retained.hp2_level == second;
+}
+
 inline Candidate minimum_active_candidate(const DispatchInput& in, const DispatchTuning& tuning) {
   Candidate minimum;
   const int hp1_max = applied_level(in.hp1) > 0 ? kMaxLevel : 0;
@@ -262,11 +308,7 @@ inline Candidate minimum_active_candidate(const DispatchInput& in, const Dispatc
   for (int first = 0; first <= hp1_max; ++first) {
     for (int second = 0; second <= hp2_max; ++second) {
       // Extension may retain active units, never borrow the minimum of an idle peer.
-      if (in.duo) {
-        const auto retained = oq_hp_candidate::preserve_active_topology_during_suspect(
-            {first, second, sanitized_candidate(in.hp1), sanitized_candidate(in.hp2), true});
-        if (retained.hp1_level != first || retained.hp2_level != second) continue;
-      }
+      if (!preserves_active_topology(in, first, second)) continue;
       const auto candidate = make_candidate(in, tuning, first, second, 0.0f);
       if (!candidate.valid || candidate.active_count == 0 || candidate.thermal_w <= 0.0f) continue;
       const int highest_level = std::max(first, second);
@@ -277,15 +319,53 @@ inline Candidate minimum_active_candidate(const DispatchInput& in, const Dispatc
   }
   return minimum;
 }
+
+struct RunExtensionMinimum {
+  float thermal_w = NAN;
+  int comfort_level = 0;
+};
+
+inline RunExtensionMinimum run_extension_minimum(const DispatchInput& in, const DispatchTuning& tuning,
+                                                 float base_requested_w, PairPower reference_f1_power) {
+  const auto minimum = minimum_active_candidate(in, tuning);
+  if (!minimum.valid) return {};
+  const int level = std::max(minimum.hp1_level, minimum.hp2_level);
+  if (level <= 1 || !(base_requested_w < minimum.thermal_w)) return {minimum.thermal_w, level};
+
+  // The floor follows live dispatch. Only keep the comfort margin when F1 would
+  // be feasible at no more heat without an unconfirmed override or modulation hold.
+  const int hp1_max = applied_level(in.hp1) > 0 ? 1 : 0;
+  const int hp2_max = in.duo && applied_level(in.hp2) > 0 ? 1 : 0;
+  for (int first = 0; first <= hp1_max; ++first) {
+    for (int second = 0; second <= hp2_max; ++second) {
+      if (first + second == 0 || !preserves_active_topology(in, first, second)) continue;
+      const auto f1 = make_candidate(in, tuning, first, second, 0.0f, false, reference_f1_power);
+      if (f1.valid && f1.thermal_w > 0.0f && f1.thermal_w <= minimum.thermal_w) return {minimum.thermal_w, 1};
+    }
+  }
+  return {minimum.thermal_w, level};
+}
+
 inline Candidate pick_topology(const DispatchInput& in, const DispatchTuning& tuning, float target_w, int active_count,
-                               float tie_band_w) {
+                               float tie_band_w, bool require_confirmed = false,
+                               ConfirmedPower confirmed_power = nullptr) {
   Candidate chosen;
   float best_error_w = INFINITY;
+  const auto sufficient = [&](const Candidate& candidate) {
+    if (!require_confirmed || confirmed_power == nullptr) return true;
+    const int first = candidate.hp1_level, second = candidate.hp2_level;
+    const bool removing = (first == 0 && applied_level(in.hp1) > 0 && !in.hp1.candidate.must_stop) ||
+                          (second == 0 && applied_level(in.hp2) > 0 && !in.hp2.candidate.must_stop);
+    if (!removing) return true;
+    if (in.hp1.defrost || in.hp1.valve_defrost || in.hp2.defrost || in.hp2.valve_defrost) return false;
+    const float confirmed = confirmed_power(in.pair_context, first, second, candidate.thermal_w);
+    return std::isfinite(confirmed) && confirmed >= 0 && confirmed + tie_band_w >= target_w;
+  };
   for (int hp1 = 0; hp1 <= kMaxLevel; ++hp1)
     for (int hp2 = 0; hp2 <= (in.duo ? kMaxLevel : 0); ++hp2) {
       if (topology(hp1, hp2) != active_count) continue;
       const auto candidate = make_candidate(in, tuning, hp1, hp2, target_w);
-      if (candidate.valid && candidate.active_count == active_count)
+      if (candidate.valid && candidate.active_count == active_count && sufficient(candidate))
         best_error_w = std::min(best_error_w, candidate.error_w);
     }
   for (int hp1 = 0; hp1 <= kMaxLevel; ++hp1)
@@ -293,7 +373,7 @@ inline Candidate pick_topology(const DispatchInput& in, const DispatchTuning& tu
       if (topology(hp1, hp2) != active_count) continue;
       const auto candidate = make_candidate(in, tuning, hp1, hp2, target_w);
       if (candidate.valid && candidate.active_count == active_count && candidate.error_w <= best_error_w + tie_band_w &&
-          (!chosen.valid || better_candidate(candidate, chosen)))
+          sufficient(candidate) && (!chosen.valid || better_candidate(candidate, chosen)))
         chosen = candidate;
     }
   return chosen;
@@ -310,7 +390,8 @@ inline float dispatch_capacity(const DispatchInput& in, const DispatchTuning& tu
   return capacity_w;
 }
 inline DispatchDecision decide_dispatch(const DispatchInput& in, const DispatchTuning& tuning,
-                                        const DispatchState& state) {
+                                        const DispatchState& state, ConfirmedPower confirmed_power = nullptr,
+                                        PendingSinglePower pending_single = {}) {
   DispatchDecision out;
   const bool request_valid = std::isfinite(in.requested_w) && in.requested_w >= 0.0f;
   bool model_available = false;
@@ -388,8 +469,11 @@ inline DispatchDecision decide_dispatch(const DispatchInput& in, const DispatchT
         std::isfinite(tuning.topology_heat_advantage_w) && tuning.topology_heat_advantage_w >= 0.0f
             ? tuning.topology_heat_advantage_w
             : 450.0f;
-    const Candidate single = pick_topology(in, tuning, target_w, 1, tie_band_w);
     const Candidate duo = pick_topology(in, tuning, target_w, 2, tie_band_w);
+    // Do not shed a running peer on temporary startup/oil-return power. When
+    // Duo cannot safely run (including a forced stop or peak limit), Single
+    // remains available even if it cannot cover the complete heat request.
+    const Candidate single = pick_topology(in, tuning, target_w, 1, tie_band_w, duo.valid, confirmed_power);
     Candidate best;
     const bool have_best = single.valid || duo.valid;
     if (single.valid && duo.valid) {
@@ -440,6 +524,39 @@ inline DispatchDecision decide_dispatch(const DispatchInput& in, const DispatchT
       reason = keep_current ? Reason::KEEP_CURRENT : Reason::NO_CANDIDATE;
     }
     Candidate chosen = keep_current && current.valid ? current : best;
+    // Before starting the other HP, give the held Single a chance to cover
+    // the full request on its current command or a safe higher command.
+    const auto& running = current.hp1_level > 0 ? in.hp1 : in.hp2;
+    if (chosen.valid && chosen.starts > 0 && current.valid && current.active_count == 1 &&
+        running.feedback_hold_level > 0 && running.feedback_hold_level == applied_level(running) &&
+        running.fixed_level == 0 && running.candidate.available_for_start && !running.candidate.link_suspect &&
+        !in.hp1.defrost && !in.hp2.defrost && !valve_defrost &&
+        !tail_active(state.hp1_defrost, in.now_ms, kDefrostHoldMs) &&
+        !tail_active(state.hp2_defrost, in.now_ms, kDefrostHoldMs) &&
+        !tail_active(state.oil_return, in.now_ms, kOilReturnHoldMs)) {
+      const float maximum_error_w = std::max(tie_band_w, heat_advantage_w);
+      const float electrical_limit_w = std::min(tuning.peak_limit_w, tuning.soft_limit_w + chosen.over_soft_w + 1.0f);
+      const bool current_suffices =
+          fits_single_request(current.thermal_w, in.requested_w, tie_band_w, maximum_error_w) &&
+          current.electrical_w <= electrical_limit_w;
+      const bool pending_suffices =
+          pending_single.thermal_w > 0.0f &&
+          fits_single_request(pending_single.thermal_w, in.requested_w, tie_band_w, maximum_error_w) &&
+          pending_single.electrical_w <= electrical_limit_w;
+      if (current_suffices || pending_suffices) {
+        chosen = current;
+        reason = Reason::HOLD_ACTIVE;
+      } else {
+        const auto upshift = upshift_held_single(in, tuning, chosen, tie_band_w, maximum_error_w);
+        if (upshift.valid) {
+          chosen = upshift;
+          reason = Reason::BETTER_HEAT;
+          out.capacity_w = std::max(out.capacity_w, upshift.thermal_w);
+          out.deficit_w = std::max(0.0f, in.requested_w - out.capacity_w);
+          out.saturated = out.deficit_w > 0.0f;
+        }
+      }
+    }
     const int boost_steps = std::max(0, std::min(3, tuning.defrost_boost_steps));
     if (chosen.valid && chosen.active_count == 2 && boost_steps > 0 &&
         defrost_boost_demand_allowed(in.requested_w, tuning) && chosen.thermal_w + tie_band_w < target_w &&
